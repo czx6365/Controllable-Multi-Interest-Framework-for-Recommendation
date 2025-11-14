@@ -1,6 +1,6 @@
 # Controllable Multi-Interest Framework for Recommendation
 
-基于多兴趣学习的推荐系统框架，实现了主流的序列推荐模型（含多兴趣模型），支持用户行为序列建模、多兴趣提取与个性化推荐，参考论文《Controllable Multi-Interest Framework for Recommendation》（KDD 2020）。czx改编
+基于多兴趣学习的推荐系统框架，实现了主流的序列推荐模型（含多兴趣模型），支持用户行为序列建模、多兴趣提取与个性化推荐，参考论文《Controllable Multi-Interest Framework for Recommendation》（KDD 2020）。
 
 ## 项目简介
 

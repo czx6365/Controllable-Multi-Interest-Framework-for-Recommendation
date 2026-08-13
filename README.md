@@ -10,8 +10,6 @@ The purpose of the repository is to study how a single user behavior sequence ca
 
 ## What Is Implemented
 
-The current code provides several sequential recommendation baselines and multi-interest models through a common TensorFlow/Keras interface:
-
 | Model | Main idea |
 | --- | --- |
 | `DNN` | pooled history embedding followed by feed-forward layers |
@@ -22,151 +20,98 @@ The current code provides several sequential recommendation baselines and multi-
 
 The model factory in [`model.py`](model.py) exposes these implementations through a shared training interface.
 
-## Why Multi-Interest Recommendation?
-
-A single embedding can be too restrictive for users whose histories contain several unrelated interests.
-
-For example:
+## System View
 
 ```text
-User history
-├── machine learning books
-├── running shoes
-├── coffee equipment
-└── travel guides
+User behavior sequence
+        ↓
+Sequence encoder
+        ↓
+Single / multiple interest embeddings
+        ↓
+FAISS or NumPy inner-product retrieval
+        ↓
+Top-K ranking
+        ↓
+Recall / NDCG / HitRate / Diversity
 ```
-
-Compressing all of these behaviors into one vector can blur distinct intent. Multi-interest models instead learn several user vectors:
-
-```text
-behavior sequence
-      ↓
-sequence encoder
-      ↓
-multiple interest embeddings
-      ↓
-interest-aware retrieval
-      ↓
-Top-K recommendations
-```
-
-The repository is useful for comparing different mechanisms for extracting those latent interests.
 
 ## Core Components
 
-### `model.py`
+- [`model.py`](model.py): item embeddings, DNN/GRU encoders, capsule routing, self-attention interest extraction, and model save/load utilities.
+- [`train.py`](train.py): portable training, retrieval, evaluation, early stopping, testing, and embedding export.
+- [`data_iterator.py`](data_iterator.py): sequential recommendation data loading and history-mask construction.
+- [`mostpop.py`](mostpop.py): popularity-oriented baseline.
 
-Implements the recommendation models and shared `BaseModel` interface.
+## Data Layout
 
-Key pieces include:
+`train.py` no longer contains machine-specific Windows paths. Supply the dataset directory with `--data-dir`, the `REC_DATA_DIR` environment variable, or the default `data/<dataset>` layout.
 
-- item embeddings;
-- sequence masking;
-- DNN and GRU encoders;
-- capsule-network dynamic routing;
-- multi-head interest extraction;
-- hard interest readout;
-- model save/load utilities.
-
-### `train.py`
-
-Contains the training and evaluation pipeline.
-
-The evaluation path includes:
-
-- item embedding export;
-- FAISS inner-product retrieval when available;
-- NumPy retrieval fallback;
-- Recall;
-- NDCG;
-- Hit Rate;
-- recommendation diversity based on item categories.
-
-### `data_iterator.py`
-
-Loads sequential recommendation data and constructs history / mask inputs for the models.
-
-### `mostpop.py`
-
-Provides a popularity-oriented baseline for comparison.
-
-## Repository Structure
+Expected files:
 
 ```text
-.
-├── README.md
-├── data_iterator.py
-├── model.py
-├── mostpop.py
-├── train.py
-└── requirements
+<data-dir>/
+├── <dataset>_train.txt
+├── <dataset>_valid.txt
+├── <dataset>_test.txt
+└── <dataset>_item_cate.txt
 ```
 
-## Data
-
-The original study data can be downloaded from the link referenced by the previous version of this repository:
-
-```bash
-wget "https://www.dropbox.com/s/m41kahhhx0a5z0u/data.tar.gz?dl=1" -O data.tar.gz
-tar -xzf data.tar.gz
-```
-
-The current `train.py` expects dataset files in the format used by the Book / Taobao experiments:
-
-```text
-<dataset>_train.txt
-<dataset>_valid.txt
-<dataset>_test.txt
-<dataset>_item_cate.txt
-```
+`item_count` is inferred from the item-category mapping by default and can be overridden with `--item-count`.
 
 ## Running the Code
 
-Install dependencies from the repository's dependency file:
+Install dependencies:
 
 ```bash
 pip install -r requirements
 ```
 
-The command-line entry point is `train.py`.
-
 ### Train
 
 ```bash
-python train.py -p train --dataset book --model_type ComiRec-SA
+python train.py \
+  -p train \
+  --dataset book \
+  --data-dir /path/to/book_data \
+  --model-type ComiRec-SA \
+  --experiment-name book_comirec_sa
+```
+
+Instead of passing the path each time:
+
+```bash
+export REC_DATA_DIR=/path/to/book_data
+python train.py -p train --dataset book --model-type MIND
 ```
 
 ### Test
 
 ```bash
-python train.py -p test --dataset book --model_type ComiRec-SA
+python train.py \
+  -p test \
+  --dataset book \
+  --data-dir /path/to/book_data \
+  --model-type ComiRec-SA \
+  --experiment-name book_comirec_sa
 ```
 
 ### Export embeddings
 
 ```bash
-python train.py -p output --dataset book --model_type ComiRec-SA
+python train.py \
+  -p output \
+  --dataset book \
+  --data-dir /path/to/book_data \
+  --model-type ComiRec-SA \
+  --experiment-name book_comirec_sa
 ```
 
-Supported model names include:
-
-```text
-DNN
-GRU4REC
-MIND
-ComiRec-DR
-ComiRec-SA
-```
-
-### Important portability note
-
-The current training script still contains local dataset-path defaults for the Book and Taobao datasets. Before running on a new machine, update the dataset path configuration in `train.py` or adapt it to your local directory layout.
-
-This is a known engineering limitation of the current reproduction code and is intentionally documented rather than hidden.
+Useful overrides include `--batch-size`, `--maxlen`, `--test-iter`, `--item-count`, `--topN`, and `--coef`.
 
 ## Evaluation
 
-The evaluation pipeline retrieves Top-K items from learned item embeddings and reports metrics such as:
+The evaluation pipeline retrieves Top-K items from learned item embeddings and reports:
 
 ```text
 Recall@K
@@ -175,25 +120,31 @@ HitRate@K
 Diversity@K
 ```
 
-FAISS is used when available; otherwise the code falls back to NumPy similarity search.
+FAISS is used when available; otherwise the code falls back to NumPy inner-product search.
+
+## Engineering Cleanup
+
+The public training entry point is intentionally portable:
+
+- no personal drive letters or local absolute paths;
+- dataset directory configurable by CLI or environment variable;
+- dataset files validated before training starts;
+- item vocabulary size inferred when possible;
+- dataset-specific hyperparameter defaults separated from filesystem configuration;
+- non-interactive experiment naming for scripted runs.
 
 ## What This Repository Demonstrates
 
-From an engineering / research-training perspective, the project demonstrates:
-
 - sequential recommendation modeling;
-- user and item embeddings;
 - multi-interest representation learning;
 - capsule-network dynamic routing;
 - self-attention interest extraction;
-- retrieval with FAISS;
-- ranking evaluation;
-- reproduction and adaptation of recommendation-system research code.
+- FAISS retrieval and ranking evaluation;
+- reproducible configuration of research code;
+- reproduction and adaptation of recommendation-system research.
 
 ## Research Integrity / Attribution
 
 This codebase is maintained as a **study and reproduction repository**. The underlying multi-interest modeling ideas originate from prior recommendation-system research, including the KDD 2020 work *Controllable Multi-Interest Framework for Recommendation*.
 
-No claim is made here that the baseline architectures in this repository are novel contributions of this repository.
-
-For graduate-application review, this repository should be read as evidence of recommendation-model implementation and experimentation, while separate research projects should be evaluated from their own codebases and documentation.
+No claim is made here that these baseline architectures are novel contributions of this repository. For graduate-application review, this repository should be read as evidence of recommendation-model implementation and experimentation; later generative-recommendation research is a separate project.

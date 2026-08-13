@@ -1,104 +1,124 @@
+import argparse
 import math
+import os
 import random
 import shutil
 import sys
 import time
 from collections import defaultdict
-import argparse
+from pathlib import Path
+
 import numpy as np
-import warnings
-warnings.filterwarnings('ignore')
-import faiss
+import tensorflow as tf
+
+try:
+    import faiss
+except ImportError:
+    faiss = None
+
 from data_iterator import DataIterator
-from model import *
+from model import Model_ComiRec_DR, Model_ComiRec_SA, Model_DNN, Model_GRU4REC, Model_MIND
 
 
+best_metric = 0.0
 
-best_metric = 0
+# Dataset-specific training defaults belong in code; filesystem locations do not.
+DATASET_DEFAULTS = {
+    "book": {
+        "batch_size": 128,
+        "maxlen": 20,
+        "test_iter": 1000,
+    },
+    "taobao": {
+        "batch_size": 256,
+        "maxlen": 50,
+        "test_iter": 500,
+    },
+}
 
 
 def prepare_data(src, target):
-    """准备数据"""
+    """将 DataIterator 的输出整理为训练/评估需要的四元组。"""
     nick_id, item_id = src
     hist_item, hist_mask = target
     return nick_id, item_id, hist_item, hist_mask
 
 
 def load_item_cate(source):
-    """加载物品类别映射表"""
+    """读取 item -> category 映射。"""
     item_cate = {}
-    try:
-        with open(source, 'r', encoding='utf-8') as f:
-            for line in f:
-                conts = line.strip().split(',')
-                if len(conts) >= 2:
-                    item_id = int(conts[0])
-                    cate_id = int(conts[1])
-                    item_cate[item_id] = cate_id
-    except Exception as e:
-        print(f"加载类别文件时出错: {e}")
+    with open(source, "r", encoding="utf-8") as file:
+        for line in file:
+            conts = line.strip().split(",")
+            if len(conts) >= 2:
+                item_cate[int(conts[0])] = int(conts[1])
     return item_cate
 
 
+def infer_item_count(cate_file):
+    """从类别映射文件推断 embedding table 大小，避免机器相关的硬编码 item_count。"""
+    item_cate = load_item_cate(cate_file)
+    if not item_cate:
+        raise ValueError(f"无法从类别文件推断 item_count: {cate_file}")
+    return max(item_cate) + 1
+
+
 def compute_diversity(item_list, item_cate_map):
-    """计算推荐列表的多样性"""
+    """计算推荐列表中不同类别物品对的比例。"""
     n = len(item_list)
     if n <= 1:
         return 0.0
 
     diversity = 0.0
+    valid_pairs = 0
     for i in range(n):
         for j in range(i + 1, n):
             if item_list[i] in item_cate_map and item_list[j] in item_cate_map:
+                valid_pairs += 1
                 diversity += item_cate_map[item_list[i]] != item_cate_map[item_list[j]]
 
-    diversity /= ((n - 1) * n / 2)
-    return diversity
+    return diversity / valid_pairs if valid_pairs else 0.0
 
 
 def create_faiss_index(item_embs, embedding_dim):
-    """创建FAISS索引"""
+    """创建 FAISS 内积索引；没有 FAISS 时回退到 NumPy。"""
     if faiss is None:
-        print("警告: 使用numpy进行相似度搜索，性能可能较低")
         return None
 
     try:
-        if tf.config.list_physical_devices('GPU'):
-            # GPU版本
-            res = faiss.StandardGpuResources()
-            flat_config = faiss.GpuIndexFlatConfig()
-            flat_config.device = 0
-            index = faiss.GpuIndexFlatIP(res, embedding_dim, flat_config)
+        if tf.config.list_physical_devices("GPU") and hasattr(faiss, "StandardGpuResources"):
+            resources = faiss.StandardGpuResources()
+            config = faiss.GpuIndexFlatConfig()
+            config.device = 0
+            index = faiss.GpuIndexFlatIP(resources, embedding_dim, config)
         else:
-            # CPU版本
             index = faiss.IndexFlatIP(embedding_dim)
-
-        index.add(item_embs)
+        index.add(item_embs.astype(np.float32))
         return index
-    except Exception as e:
-        print(f"创建FAISS索引失败: {e}")
+    except Exception as exc:
+        print(f"FAISS 索引创建失败，将使用 NumPy 检索: {exc}")
         return None
 
 
-def numpy_search(user_embs, item_embs, topN):
-    """使用numpy进行相似度搜索（FAISS的备选方案）"""
+def numpy_search(user_embs, item_embs, top_n):
+    """FAISS 不可用时的 NumPy 内积检索。"""
     similarities = np.dot(user_embs, item_embs.T)
-    indices = np.argsort(similarities, axis=1)[:, ::-1][:, :topN]
+    indices = np.argsort(similarities, axis=1)[:, ::-1][:, :top_n]
     distances = np.take_along_axis(similarities, indices, axis=1)
     return distances, indices
 
 
-def evaluate_full(model, test_data, model_path, batch_size, item_cate_map, save=True, coef=None):
-    """全面评估模型性能"""
-    topN = args.topN
+def _search(index, user_embs, item_embs, top_n):
+    if index is not None:
+        return index.search(user_embs.astype(np.float32), top_n)
+    return numpy_search(user_embs, item_embs, top_n)
 
-    # 获取物品嵌入向量
+
+def evaluate_full(model, test_data, item_cate_map, top_n, embedding_dim, save=True, coef=None):
+    """计算 Recall、NDCG、HitRate，以及可选的推荐多样性。"""
     item_embs = model.output_item()
+    search_index = create_faiss_index(item_embs, embedding_dim)
 
-    # 创建搜索索引
-    search_index = create_faiss_index(item_embs, args.embedding_dim)
-
-    # 初始化评估指标
     total = 0
     total_recall = 0.0
     total_ndcg = 0.0
@@ -106,456 +126,414 @@ def evaluate_full(model, test_data, model_path, batch_size, item_cate_map, save=
     total_diversity = 0.0
 
     for src, tgt in test_data:
-        nick_id, item_id, hist_item, hist_mask = prepare_data(src, tgt)
+        _, item_id, hist_item, hist_mask = prepare_data(src, tgt)
         user_embs = model.output_user([hist_item, hist_mask])
-
-        if search_index is not None:
-            # 使用FAISS搜索
-            D, I = search_index.search(user_embs, topN)
-        else:
-            # 使用numpy搜索
-            D, I = numpy_search(user_embs, item_embs, topN)
+        distances, indices = _search(search_index, user_embs, item_embs, top_n)
 
         if len(user_embs.shape) == 2:
-            # 单兴趣模型
             for i, iid_list in enumerate(item_id):
-                recall = 0
+                true_items = set(iid_list)
+                hits = 0
                 dcg = 0.0
-                true_item_set = set(iid_list)
+                for rank, iid in enumerate(indices[i]):
+                    if iid in true_items:
+                        hits += 1
+                        dcg += 1.0 / math.log(rank + 2, 2)
 
-                for no, iid in enumerate(I[i]):
-                    if iid in true_item_set:
-                        recall += 1
-                        dcg += 1.0 / math.log(no + 2, 2)
-
-                idcg = 0.0
-                for no in range(recall):
-                    idcg += 1.0 / math.log(no + 2, 2)
-
-                total_recall += recall * 1.0 / len(iid_list)
-                if recall > 0:
+                idcg = sum(1.0 / math.log(rank + 2, 2) for rank in range(hits))
+                total_recall += hits / max(len(iid_list), 1)
+                if hits:
                     total_ndcg += dcg / idcg
                     total_hitrate += 1
                 if not save:
-                    total_diversity += compute_diversity(I[i], item_cate_map)
+                    total_diversity += compute_diversity(indices[i], item_cate_map)
         else:
-            # 多兴趣模型
-            ni = user_embs.shape[1]
+            num_interest = user_embs.shape[1]
             user_embs_flat = np.reshape(user_embs, [-1, user_embs.shape[-1]])
-
-            if search_index is not None:
-                D, I = search_index.search(user_embs_flat, topN)
-            else:
-                D, I = numpy_search(user_embs_flat, item_embs, topN)
+            distances, indices = _search(search_index, user_embs_flat, item_embs, top_n)
 
             for i, iid_list in enumerate(item_id):
-                recall = 0
-                dcg = 0.0
-                item_list_set = set()
-                item_cor_list = []
+                candidate_items = list(
+                    zip(
+                        np.reshape(indices[i * num_interest:(i + 1) * num_interest], -1),
+                        np.reshape(distances[i * num_interest:(i + 1) * num_interest], -1),
+                    )
+                )
+                candidate_items.sort(key=lambda pair: pair[1], reverse=True)
 
+                ranked_items = []
+                seen = set()
                 if coef is None:
-                    item_list = list(zip(
-                        np.reshape(I[i * ni:(i + 1) * ni], -1),
-                        np.reshape(D[i * ni:(i + 1) * ni], -1)
-                    ))
-                    item_list.sort(key=lambda x: x[1], reverse=True)
-
-                    for j in range(len(item_list)):
-                        if item_list[j][0] not in item_list_set and item_list[j][0] != 0:
-                            item_list_set.add(item_list[j][0])
-                            item_cor_list.append(item_list[j][0])
-                            if len(item_list_set) >= topN:
+                    for item, _score in candidate_items:
+                        if item != 0 and item not in seen:
+                            ranked_items.append(item)
+                            seen.add(item)
+                            if len(ranked_items) >= top_n:
                                 break
                 else:
-                    origin_item_list = list(zip(
-                        np.reshape(I[i * ni:(i + 1) * ni], -1),
-                        np.reshape(D[i * ni:(i + 1) * ni], -1)
-                    ))
-                    origin_item_list.sort(key=lambda x: x[1], reverse=True)
+                    rerank_pool = []
+                    for item, score in candidate_items:
+                        if item not in seen and item in item_cate_map:
+                            rerank_pool.append((item, score, item_cate_map[item]))
+                            seen.add(item)
 
-                    item_list = []
-                    tmp_item_set = set()
-                    for (x, y) in origin_item_list:
-                        if x not in tmp_item_set and x in item_cate_map:
-                            item_list.append((x, y, item_cate_map[x]))
-                            tmp_item_set.add(x)
-
-                    cate_dict = defaultdict(int)
-                    for j in range(topN):
-                        if not item_list:
+                    category_counts = defaultdict(int)
+                    for _ in range(top_n):
+                        if not rerank_pool:
                             break
+                        best_index = max(
+                            range(len(rerank_pool)),
+                            key=lambda idx: rerank_pool[idx][1]
+                            - coef * category_counts[rerank_pool[idx][2]],
+                        )
+                        item, _score, category = rerank_pool.pop(best_index)
+                        ranked_items.append(item)
+                        category_counts[category] += 1
 
-                        max_index = 0
-                        max_score = item_list[0][1] - coef * cate_dict[item_list[0][2]]
-                        for k in range(1, len(item_list)):
-                            current_score = item_list[k][1] - coef * cate_dict[item_list[k][2]]
-                            if current_score > max_score:
-                                max_index = k
-                                max_score = current_score
+                true_items = set(iid_list)
+                hits = 0
+                dcg = 0.0
+                for rank, iid in enumerate(ranked_items):
+                    if iid in true_items:
+                        hits += 1
+                        dcg += 1.0 / math.log(rank + 2, 2)
 
-                        item_list_set.add(item_list[max_index][0])
-                        item_cor_list.append(item_list[max_index][0])
-                        cate_dict[item_list[max_index][2]] += 1
-                        item_list.pop(max_index)
-
-                true_item_set = set(iid_list)
-                for no, iid in enumerate(item_cor_list):
-                    if iid in true_item_set:
-                        recall += 1
-                        dcg += 1.0 / math.log(no + 2, 2)
-
-                idcg = 0.0
-                for no in range(recall):
-                    idcg += 1.0 / math.log(no + 2, 2)
-
-                total_recall += recall * 1.0 / len(iid_list)
-                if recall > 0:
+                idcg = sum(1.0 / math.log(rank + 2, 2) for rank in range(hits))
+                total_recall += hits / max(len(iid_list), 1)
+                if hits:
                     total_ndcg += dcg / idcg
                     total_hitrate += 1
                 if not save:
-                    total_diversity += compute_diversity(list(item_list_set), item_cate_map)
+                    total_diversity += compute_diversity(ranked_items, item_cate_map)
 
         total += len(item_id)
 
-    recall = total_recall / total
-    ndcg = total_ndcg / total
-    hitrate = total_hitrate * 1.0 / total
-    diversity = total_diversity * 1.0 / total if not save else 0.0
+    if total == 0:
+        raise ValueError("评估数据为空。")
 
-    if save:
-        return {'recall': recall, 'ndcg': ndcg, 'hitrate': hitrate}
-    return {'recall': recall, 'ndcg': ndcg, 'hitrate': hitrate, 'diversity': diversity}
-
-
-def get_model(dataset, model_type, item_count, batch_size, maxlen):
-    """根据模型类型创建对应的模型实例"""
-    model_classes = {
-        'DNN': Model_DNN,
-        'GRU4REC': Model_GRU4REC,
-        'MIND': Model_MIND,
-        'ComiRec-DR': Model_ComiRec_DR,
-        'ComiRec-SA': Model_ComiRec_SA
+    metrics = {
+        "recall": total_recall / total,
+        "ndcg": total_ndcg / total,
+        "hitrate": total_hitrate / total,
     }
+    if not save:
+        metrics["diversity"] = total_diversity / total
+    return metrics
 
+
+def get_model(dataset, model_type, item_count, batch_size, maxlen, args):
+    """根据模型类型构建推荐模型。"""
+    model_classes = {
+        "DNN": Model_DNN,
+        "GRU4REC": Model_GRU4REC,
+        "MIND": Model_MIND,
+        "ComiRec-DR": Model_ComiRec_DR,
+        "ComiRec-SA": Model_ComiRec_SA,
+    }
     if model_type not in model_classes:
-        print(f"无效的模型类型: {model_type}")
-        return None
+        raise ValueError(f"不支持的模型类型: {model_type}")
 
-    # 创建模型实例
-    if model_type == 'MIND':
-        relu_layer = dataset == 'book'
+    if model_type == "MIND":
         model = model_classes[model_type](
-            item_count, args.embedding_dim, args.hidden_size, batch_size,
-            args.num_interest, maxlen, relu_layer=relu_layer
+            item_count,
+            args.embedding_dim,
+            args.hidden_size,
+            batch_size,
+            args.num_interest,
+            maxlen,
+            relu_layer=(dataset == "book"),
         )
-    elif model_type in ['ComiRec-DR', 'ComiRec-SA']:
+    elif model_type in {"ComiRec-DR", "ComiRec-SA"}:
         model = model_classes[model_type](
-            item_count, args.embedding_dim, args.hidden_size, batch_size,
-            args.num_interest, maxlen
+            item_count,
+            args.embedding_dim,
+            args.hidden_size,
+            batch_size,
+            args.num_interest,
+            maxlen,
         )
     else:
         model = model_classes[model_type](
-            item_count, args.embedding_dim, args.hidden_size, batch_size, maxlen
+            item_count,
+            args.embedding_dim,
+            args.hidden_size,
+            batch_size,
+            maxlen,
         )
 
-    # 构建模型
-    print(f"构建 {model_type} 模型...")
-    try:
-        # 定义输入形状并构建模型
-        input_shapes = [
-            (None,),  # nick_id
-            (None,),  # item_id
-            (None, maxlen),  # hist_item
-            (None, maxlen)  # hist_mask
-        ]
-        model.build(input_shapes)
-        print("模型构建成功")
-    except Exception as e:
-        print(f"模型构建警告: {e}")
-        # 尝试通过前向传播构建
-        try:
-            import numpy as np
-            dummy_inputs = [
-                np.zeros((batch_size,), dtype=np.int32),  # nick_id
-                np.zeros((batch_size,), dtype=np.int32),  # item_id
-                np.zeros((batch_size, maxlen), dtype=np.int32),  # hist_item
-                np.zeros((batch_size, maxlen), dtype=np.int32)  # hist_mask
-            ]
-            _ = model(dummy_inputs, training=False)
-            print("通过前向传播构建模型成功")
-        except Exception as e2:
-            print(f"模型构建失败: {e2}")
-            return None
-
+    # Keras 子类模型会在第一次前向传播时真正创建权重。
+    dummy_history = np.zeros((1, maxlen), dtype=np.int32)
+    dummy_mask = np.ones((1, maxlen), dtype=np.float32)
+    model([dummy_history, dummy_mask], training=False)
     return model
 
 
-def get_exp_name(dataset, model_type, batch_size, lr, maxlen, save=True):
-    """生成实验名称"""
-    extr_name = input('请输入实验名称: ')
-    para_name = '_'.join([
-        dataset, model_type, f'b{batch_size}',
-        f'lr{lr}', f'd{args.embedding_dim}', f'len{maxlen}'
-    ])
-    exp_name = para_name + '_' + extr_name
-
-    if save and os.path.exists('runs/' + exp_name):
-        flag = input('实验名称已存在，是否覆盖? (y/n) ')
-        if flag.lower() == 'y':
-            shutil.rmtree('runs/' + exp_name)
-        else:
-            extr_name = input('请输入新的实验名称: ')
-            exp_name = para_name + '_' + extr_name
-
-    return exp_name
+def get_exp_name(dataset, model_type, batch_size, lr, maxlen, experiment_name):
+    """生成非交互式实验名称，便于脚本化和复现。"""
+    base = "_".join(
+        [dataset, model_type, f"b{batch_size}", f"lr{lr}", f"d{args.embedding_dim}", f"len{maxlen}"]
+    )
+    return f"{base}_{experiment_name}" if experiment_name else base
 
 
 def setup_gpu():
-    """设置GPU配置"""
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
+    """按需启用 TensorFlow GPU memory growth。"""
+    for gpu in tf.config.experimental.list_physical_devices("GPU"):
         try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(e)
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as exc:
+            print(exc)
 
 
 def train_model(
-        train_file,
-        valid_file,
-        test_file,
-        cate_file,
-        item_count,
-        dataset="book",
-        batch_size=128,
-        maxlen=100,
-        test_iter=50,
-        model_type='DNN',
-        lr=0.001,
-        max_iter=100,
-        patience=20
+    train_file,
+    valid_file,
+    test_file,
+    cate_file,
+    item_count,
+    dataset,
+    batch_size,
+    maxlen,
+    test_iter,
+    model_type,
+    lr,
+    max_iter,
+    patience,
+    args,
 ):
-    """训练模型的主函数 - TensorFlow 2.x 版本"""
-    exp_name = get_exp_name(dataset, model_type, batch_size, lr, maxlen)
-    best_model_path = "best_model/" + exp_name + '/'
+    """训练并在验证集上早停，最后报告验证/测试指标。"""
+    global best_metric
+    best_metric = 0.0
+
+    exp_name = get_exp_name(
+        dataset, model_type, batch_size, lr, maxlen, args.experiment_name
+    )
+    best_model_path = os.path.join("best_model", exp_name)
+
+    if args.overwrite and os.path.exists(best_model_path):
+        shutil.rmtree(best_model_path)
 
     setup_gpu()
-
-    # 初始化TensorBoard
-    writer = None
-    try:
-        from tensorboard import SummaryWriter
-        writer = SummaryWriter('runs/' + exp_name)
-    except ImportError:
-        try:
-            from tensorboardX import SummaryWriter
-            writer = SummaryWriter('runs/' + exp_name)
-        except ImportError:
-            print("警告: 未找到tensorboard库，将无法记录训练日志")
-            writer = None
-
     item_cate_map = load_item_cate(cate_file)
-
-    # 创建数据迭代器
     train_data = DataIterator(train_file, batch_size, maxlen, train_flag=0)
     valid_data = DataIterator(valid_file, batch_size, maxlen, train_flag=1)
 
-    # 创建模型 - 不需要 session
-    model = get_model(dataset, model_type, item_count, batch_size, maxlen)
-    if model is None:
-        return
+    model = get_model(dataset, model_type, item_count, batch_size, maxlen, args)
 
-    print('开始训练')
+    print(f"开始训练: {exp_name}")
     start_time = time.time()
     iter_count = 0
     loss_sum = 0.0
     trials = 0
-    global best_metric
 
     try:
         for src, tgt in train_data:
             nick_id, item_id, hist_item, hist_mask = prepare_data(src, tgt)
-
-            # 使用模型的 train_step 方法
             loss_dict = model.train_step([nick_id, item_id, hist_item, hist_mask, lr])
-            loss = loss_dict['loss']
-
-            loss_sum += loss
+            loss_sum += float(loss_dict["loss"])
             iter_count += 1
 
             if iter_count % test_iter == 0:
-                # 评估模型
-                metrics = evaluate_full(model, valid_data, best_model_path, batch_size, item_cate_map)
+                metrics = evaluate_full(
+                    model,
+                    valid_data,
+                    item_cate_map,
+                    args.topN,
+                    args.embedding_dim,
+                    save=True,
+                )
+                print(
+                    f"iter={iter_count} loss={loss_sum / test_iter:.4f} "
+                    + " ".join(f"{key}={value:.6f}" for key, value in metrics.items())
+                )
 
-                log_str = f'迭代: {iter_count}, 训练损失: {loss_sum / test_iter:.4f}'
-                if metrics:
-                    log_str += ', ' + ', '.join([f'验证 {k}: {v:.6f}' for k, v in metrics.items()])
-
-                print(exp_name)
-                print(log_str)
-
-                if writer is not None:
-                    writer.add_scalar('train/loss', loss_sum / test_iter, iter_count)
-                    for key, value in metrics.items():
-                        writer.add_scalar(f'eval/{key}', value, iter_count)
-
-                if 'recall' in metrics:
-                    recall = metrics['recall']
-                    if recall > best_metric:
-                        best_metric = recall
-                        model.save_model(best_model_path)
-                        trials = 0
-                    else:
-                        trials += 1
-                        if trials > patience:
-                            print(f'早停: 连续{patience}次迭代没有提升')
-                            break
+                recall = metrics["recall"]
+                if recall > best_metric:
+                    best_metric = recall
+                    model.save_model(best_model_path)
+                    trials = 0
+                else:
+                    trials += 1
+                    if trials > patience:
+                        print(f"早停: 连续 {patience} 次评估没有提升")
+                        break
 
                 loss_sum = 0.0
-                test_time = time.time()
-                print(f"时间间隔: {(test_time - start_time) / 60.0:.4f} 分钟")
+                print(f"elapsed_min={(time.time() - start_time) / 60.0:.2f}")
 
             if iter_count >= max_iter * 1000:
                 break
-
     except KeyboardInterrupt:
-        print('提前退出训练')
+        print("训练被用户中断。")
 
-    # 加载最佳模型进行评估
+    if not os.path.exists(best_model_path):
+        model.save_model(best_model_path)
+
     model.load_model(best_model_path)
-
-    # 验证集评估
-    metrics = evaluate_full(model, valid_data, best_model_path, batch_size, item_cate_map, save=False)
-    print(', '.join([f'验证 {k}: {v:.6f}' for k, v in metrics.items()]))
-
-    # 测试集评估
+    valid_metrics = evaluate_full(
+        model, valid_data, item_cate_map, args.topN, args.embedding_dim, save=False
+    )
     test_data = DataIterator(test_file, batch_size, maxlen, train_flag=2)
-    metrics = evaluate_full(model, test_data, best_model_path, batch_size, item_cate_map, save=False)
-    print(', '.join([f'测试 {k}: {v:.6f}' for k, v in metrics.items()]))
+    test_metrics = evaluate_full(
+        model, test_data, item_cate_map, args.topN, args.embedding_dim, save=False
+    )
 
-    if writer is not None:        writer.close()
+    print("验证:", ", ".join(f"{k}={v:.6f}" for k, v in valid_metrics.items()))
+    print("测试:", ", ".join(f"{k}={v:.6f}" for k, v in test_metrics.items()))
 
 
-def test_model(
-        test_file,
-        cate_file,
-        item_count,
-        dataset="book",
-        batch_size=128,
-        maxlen=100,
-        model_type='DNN',
-        lr=0.001
-):
-    """测试模型"""
-    exp_name = get_exp_name(dataset, model_type, batch_size, lr, maxlen, save=False)
-    best_model_path = "best_model/" + exp_name + '/'
-
-    model = get_model(dataset, model_type, item_count, batch_size, maxlen)
-    if model is None:
-        return
-
+def test_model(test_file, cate_file, item_count, dataset, batch_size, maxlen, model_type, args):
+    """加载已有权重并评估。"""
+    exp_name = get_exp_name(
+        dataset, model_type, batch_size, args.learning_rate, maxlen, args.experiment_name
+    )
+    best_model_path = os.path.join("best_model", exp_name)
+    model = get_model(dataset, model_type, item_count, batch_size, maxlen, args)
     model.load_model(best_model_path)
 
     item_cate_map = load_item_cate(cate_file)
     test_data = DataIterator(test_file, batch_size, maxlen, train_flag=2)
-    metrics = evaluate_full(model, test_data, best_model_path, batch_size, item_cate_map,
-                            save=False, coef=args.coef)
-    print(', '.join([f'测试 {k}: {v:.6f}' for k, v in metrics.items()]))
+    metrics = evaluate_full(
+        model,
+        test_data,
+        item_cate_map,
+        args.topN,
+        args.embedding_dim,
+        save=False,
+        coef=args.coef,
+    )
+    print(", ".join(f"{k}={v:.6f}" for k, v in metrics.items()))
 
 
-def output_embeddings(
-        item_count,
-        dataset="book",
-        batch_size=128,
-        maxlen=100,
-        model_type='DNN',
-        lr=0.001
-):
-    """输出嵌入向量"""
-    exp_name = get_exp_name(dataset, model_type, batch_size, lr, maxlen, save=False)
-    best_model_path = "best_model/" + exp_name + '/'
-
-    model = get_model(dataset, model_type, item_count, batch_size, maxlen)
-    if model is None:
-        return
-
+def output_embeddings(item_count, dataset, batch_size, maxlen, model_type, args):
+    """导出训练后的 item embeddings。"""
+    exp_name = get_exp_name(
+        dataset, model_type, batch_size, args.learning_rate, maxlen, args.experiment_name
+    )
+    best_model_path = os.path.join("best_model", exp_name)
+    model = get_model(dataset, model_type, item_count, batch_size, maxlen, args)
     model.load_model(best_model_path)
-    item_embs = model.output_item()
 
-    os.makedirs('output', exist_ok=True)
-    np.save(f'output/{exp_name}_emb.npy', item_embs)
-    print(f'嵌入向量已保存到 output/{exp_name}_emb.npy')
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{exp_name}_emb.npy"
+    np.save(output_path, model.output_item())
+    print(f"嵌入向量已保存到: {output_path}")
 
 
-if __name__ == '__main__':
-    print(sys.argv)
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-p', type=str, default='train', help='train | test | output')
-    parser.add_argument('--dataset', type=str, default='book', help='book | taobao')
-    parser.add_argument('--random_seed', type=int, default=19)
-    parser.add_argument('--embedding_dim', type=int, default=64)
-    parser.add_argument('--hidden_size', type=int, default=64)
-    parser.add_argument('--num_interest', type=int, default=4)
-    parser.add_argument('--model_type', type=str, default='DNN')
-    parser.add_argument('--learning_rate', type=float, default=0.001)
-    parser.add_argument('--max_iter', type=int, default=1000)
-    parser.add_argument('--patience', type=int, default=50)
-    parser.add_argument('--coef', type=float, default=None)
-    parser.add_argument('--topN', type=int, default=50)
+def resolve_data_config(args):
+    """解析可移植的数据路径与数据集运行参数。"""
+    defaults = DATASET_DEFAULTS[args.dataset]
+    data_dir = Path(
+        args.data_dir
+        or os.getenv("REC_DATA_DIR", "")
+        or Path("data") / args.dataset
+    ).expanduser()
 
-    args = parser.parse_args()
-    SEED = args.random_seed
+    files = {
+        "train": data_dir / f"{args.dataset}_train.txt",
+        "valid": data_dir / f"{args.dataset}_valid.txt",
+        "test": data_dir / f"{args.dataset}_test.txt",
+        "cate": data_dir / f"{args.dataset}_item_cate.txt",
+    }
+    missing = [str(path) for path in files.values() if not path.exists()]
+    if missing:
+        expected = "\n  - ".join(missing)
+        raise FileNotFoundError(
+            "推荐数据文件不完整。通过 --data-dir 或 REC_DATA_DIR 指定数据目录。"
+            f"\n缺少:\n  - {expected}"
+        )
 
-    # 设置随机种子
-    tf.random.set_seed(SEED)
-    np.random.seed(SEED)
-    random.seed(SEED)
+    item_count = args.item_count or infer_item_count(files["cate"])
+    batch_size = args.batch_size or defaults["batch_size"]
+    maxlen = args.maxlen or defaults["maxlen"]
+    test_iter = args.test_iter or defaults["test_iter"]
+    return files, item_count, batch_size, maxlen, test_iter
 
-    # 数据配置
-    if args.dataset == 'taobao':
-        path = r'F:\科研2\data\taobao_data'
-        item_count = 1708531
-        batch_size = 256
-        maxlen = 50
-        test_iter = 500
-    elif args.dataset == 'book':
-        path = r'F:\科研2\data\book_date'
-        item_count = 367983
-        batch_size = 128
-        maxlen = 20
-        test_iter = 1000
-    else:
-        print(f"不支持的数据集: {args.dataset}")
-        sys.exit(1)
 
-    # 构建文件路径
-    train_file = os.path.join(path, f'{args.dataset}_train.txt')
-    valid_file = os.path.join(path, f'{args.dataset}_valid.txt')
-    test_file = os.path.join(path, f'{args.dataset}_test.txt')
-    cate_file = os.path.join(path, f'{args.dataset}_item_cate.txt')
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Portable training/evaluation entry point for the multi-interest recommendation study."
+    )
+    parser.add_argument("-p", choices=["train", "test", "output"], default="train")
+    parser.add_argument("--dataset", choices=sorted(DATASET_DEFAULTS), default="book")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Dataset directory. Falls back to REC_DATA_DIR, then data/<dataset>.",
+    )
+    parser.add_argument("--item-count", type=int, default=None, help="Override inferred item count.")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--maxlen", type=int, default=None)
+    parser.add_argument("--test-iter", type=int, default=None)
+    parser.add_argument("--random-seed", type=int, default=19)
+    parser.add_argument("--embedding-dim", type=int, default=64)
+    parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--num-interest", type=int, default=4)
+    parser.add_argument(
+        "--model-type",
+        choices=["DNN", "GRU4REC", "MIND", "ComiRec-DR", "ComiRec-SA"],
+        default="DNN",
+    )
+    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--coef", type=float, default=None)
+    parser.add_argument("--topN", type=int, default=50)
+    parser.add_argument("--experiment-name", type=str, default="run")
+    parser.add_argument("--output-dir", type=str, default="output")
+    parser.add_argument("--overwrite", action="store_true")
+    return parser
 
-    # 检查文件是否存在
-    for file_path in [train_file, valid_file, test_file, cate_file]:
-        if not os.path.exists(file_path):
-            print(f"警告: 文件 {file_path} 不存在")
 
-    # 执行相应操作
-    if args.p == 'train':
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+
+    tf.random.set_seed(args.random_seed)
+    np.random.seed(args.random_seed)
+    random.seed(args.random_seed)
+
+    try:
+        files, item_count, batch_size, maxlen, test_iter = resolve_data_config(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(2)
+
+    if args.p == "train":
         train_model(
-            train_file, valid_file, test_file, cate_file, item_count, args.dataset,
-            batch_size, maxlen, test_iter, args.model_type, args.learning_rate,
-            args.max_iter, args.patience
+            str(files["train"]),
+            str(files["valid"]),
+            str(files["test"]),
+            str(files["cate"]),
+            item_count,
+            args.dataset,
+            batch_size,
+            maxlen,
+            test_iter,
+            args.model_type,
+            args.learning_rate,
+            args.max_iter,
+            args.patience,
+            args,
         )
-    elif args.p == 'test':
+    elif args.p == "test":
         test_model(
-            test_file, cate_file, item_count, args.dataset, batch_size, maxlen,
-            args.model_type, args.learning_rate
-        )
-    elif args.p == 'output':
-        output_embeddings(
-            item_count, args.dataset, batch_size, maxlen, args.model_type, args.learning_rate
+            str(files["test"]),
+            str(files["cate"]),
+            item_count,
+            args.dataset,
+            batch_size,
+            maxlen,
+            args.model_type,
+            args,
         )
     else:
-        print('未指定操作...')
+        output_embeddings(
+            item_count,
+            args.dataset,
+            batch_size,
+            maxlen,
+            args.model_type,
+            args,
+        )
